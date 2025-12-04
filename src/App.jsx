@@ -1,5 +1,5 @@
 import React, { useState, useEffect, useMemo, useRef } from 'react';
-import { Play, Pause, RotateCcw, Repeat, ChevronRight, ChevronLeft, Eye, EyeOff, BarChart3, Zap, Cpu } from 'lucide-react';
+import { Play, Pause, RotateCcw, Repeat, ChevronRight, ChevronLeft, Eye, EyeOff, BarChart3, Zap, Cpu, AlertTriangle } from 'lucide-react';
 
 // === TYPES & CONSTANTS ===
 const Operation = {
@@ -24,10 +24,22 @@ const Topology = {
   MultiNode: 'Multi Node (2x8 H100)'
 };
 
+// Algorithm compatibility matrix based on NCCL documentation
+// NVLS uses SHARP ALUs for reduction OR multicast replication
+// MultiShot = ReduceScatter + AllGather decomposition (only for symmetric ops)
+const ALGORITHM_COMPATIBILITY = {
+  [Operation.AllReduce]: [Algorithm.Naive, Algorithm.Ring, Algorithm.BiRing, Algorithm.NVLS, Algorithm.MultiShot],
+  [Operation.Reduce]: [Algorithm.Naive, Algorithm.Ring, Algorithm.BiRing, Algorithm.NVLS], // NO MultiShot - asymmetric
+  [Operation.Broadcast]: [Algorithm.Naive, Algorithm.Ring, Algorithm.BiRing, Algorithm.NVLS], // Implicit MultiShot via multicast
+  [Operation.AllGather]: [Algorithm.Naive, Algorithm.Ring, Algorithm.BiRing, Algorithm.NVLS, Algorithm.MultiShot],
+  [Operation.ReduceScatter]: [Algorithm.Naive, Algorithm.Ring, Algorithm.BiRing, Algorithm.NVLS, Algorithm.MultiShot],
+  [Operation.AllToAll]: [Algorithm.Naive, Algorithm.Ring, Algorithm.BiRing] // NO NVLS/MultiShot - routing only, no reduction/replication
+};
+
 // Distinct colors for chunks
 const CHUNK_COLORS = [
   '#ef4444', '#f97316', '#eab308', '#22c55e',
-  '#06b6d4', '#3b82f6', '#8b5cf6', '#ec4899',
+  '#06b6d4', '#3b82f6', '#8b5cf6', '#ec4889',
   '#f43f5e', '#84cc16', '#14b8a6', '#6366f1',
   '#a855f7', '#f59e0b', '#10b981', '#0ea5e9'
 ];
@@ -135,57 +147,6 @@ const generateTimeline = (op, algo, topo) => {
     return duration;
   };
 
-  // Multicast: GPU sends to switch, switch broadcasts to all
-  const addMulticast = (from, destinations, chunkId, label = '') => {
-    const duration = MULTICAST_TIME;
-    
-    // Single send to switch (conceptually)
-    events.push({
-      type: 'multicast',
-      id: `mc-${events.length}`,
-      from,
-      destinations,
-      chunkId,
-      color: CHUNK_COLORS[chunkId % CHUNK_COLORS.length],
-      startTime: currentTime,
-      duration,
-      label: label || `C${chunkId}`
-    });
-
-    // Record high bandwidth utilization (switch amplification)
-    for (const dest of destinations) {
-      if (dest !== from) {
-        bandwidthSamples.push({
-          time: currentTime,
-          endTime: currentTime + duration,
-          linkId: `switch-${dest}`,
-          from: 'switch',
-          to: dest,
-          utilization: 1.0,
-          isMulticast: true
-        });
-      }
-    }
-
-    return duration;
-  };
-
-  // In-switch reduction event
-  const addSwitchReduce = (sources, chunkId, label = '') => {
-    const duration = SWITCH_COMPUTE_TIME;
-    events.push({
-      type: 'switch-reduce',
-      id: `sr-${events.length}`,
-      sources,
-      chunkId,
-      color: CHUNK_COLORS[chunkId % CHUNK_COLORS.length],
-      startTime: currentTime,
-      duration,
-      label: label || 'Σ'
-    });
-    return duration;
-  };
-
   const addCompute = (nodeId, label, duration = COMPUTE_TIME) => {
     events.push({
       type: 'compute',
@@ -206,6 +167,22 @@ const generateTimeline = (op, algo, topo) => {
       duration,
       direction
     });
+  };
+
+  // In-switch reduction event
+  const addSwitchReduce = (sources, chunkId, label = '') => {
+    const duration = SWITCH_COMPUTE_TIME;
+    events.push({
+      type: 'switch-reduce',
+      id: `sr-${events.length}`,
+      sources,
+      chunkId,
+      color: CHUNK_COLORS[chunkId % CHUNK_COLORS.length],
+      startTime: currentTime,
+      duration,
+      label: label || 'Σ'
+    });
+    return duration;
   };
 
   // === ALGORITHM IMPLEMENTATIONS ===
@@ -338,7 +315,6 @@ const generateTimeline = (op, algo, topo) => {
     }
     else if (op === Operation.AllToAll) {
       addStep('Initial: Each GPU i has N chunks, one destined for each GPU j', 'init');
-      // Initialize buffer state showing each GPU has N chunks to send
       for (let i = 0; i < NODE_COUNT; i++) {
         bufferState[i] = Array.from({ length: NODE_COUNT }, (_, j) => ({
           chunkId: j,
@@ -352,17 +328,14 @@ const generateTimeline = (op, algo, topo) => {
 
       addStep('Naive AllToAll: All N² transfers happen simultaneously → massive congestion!', 'transfer');
       
-      // Every GPU sends to every other GPU
       for (let src = 0; src < NODE_COUNT; src++) {
         for (let dst = 0; dst < NODE_COUNT; dst++) {
           if (src !== dst) {
-            // GPU src sends chunk destined for GPU dst
             addTransfer(src, dst, src * NODE_COUNT + dst, `${src}→${dst}`);
           }
         }
       }
       
-      // Record bandwidth showing congestion
       for (let i = 0; i < NODE_COUNT; i++) {
         bandwidthSamples.push({
           time: currentTime,
@@ -375,7 +348,6 @@ const generateTimeline = (op, algo, topo) => {
       
       currentTime += TRANSFER_TIME * 1.5;
 
-      // Update buffer state - each GPU now has received chunks from all others
       for (let i = 0; i < NODE_COUNT; i++) {
         bufferState[i] = Array.from({ length: NODE_COUNT }, (_, j) => ({
           chunkId: j,
@@ -394,7 +366,7 @@ const generateTimeline = (op, algo, topo) => {
       addStep('NVLS AllReduce: Leverages NVSwitch in-network reduction via multicast objects', 'init');
       currentTime += 300;
 
-      addStep('Step 1: All GPUs write to multicast address simultaneously (multimem.red)', 'scatter');
+      addStep('Step 1: All GPUs issue multimem.ld_reduce - sends local data TO switch for reduction', 'scatter');
       
       // All GPUs send to "switch" (multicast object) at once
       for (let gpu = 0; gpu < NODE_COUNT; gpu++) {
@@ -411,7 +383,7 @@ const generateTimeline = (op, algo, topo) => {
       }
       currentTime += MULTICAST_TIME;
 
-      addStep('Step 2: NVSwitch performs IN-FABRIC reduction (400 GFlops FP32 ALUs)', 'switch-reduce');
+      addStep('Step 2: NVSwitch performs IN-FABRIC reduction (SHARP ALUs: 400 GFlops FP32)', 'switch-reduce');
       
       // Switch reduction event
       addSwitchReduce(Array.from({ length: NODE_COUNT }, (_, i) => i), 0, 'Σ');
@@ -423,7 +395,7 @@ const generateTimeline = (op, algo, topo) => {
       }
       saveBufferSnapshot();
 
-      addStep('Step 3: GPUs read reduced result via multicast address (multimem.ld_reduce)', 'gather');
+      addStep('Step 3: Result available via multicast address - switch broadcasts to all GPUs', 'gather');
       
       // Switch multicasts result back to all GPUs
       events.push({
@@ -442,13 +414,13 @@ const generateTimeline = (op, algo, topo) => {
         bufferState[i] = [{ chunkId: 'all', state: 'final', reductionCount: NODE_COUNT }];
       }
 
-      addStep('Complete! NVLS achieves ~450 GB/s AllReduce BW (3× vs Ring for small messages)', 'done');
+      addStep('Complete! NVLS achieves ~480 GB/s AllReduce BW (vs ~370 GB/s Ring). SM offload!', 'done');
     }
     else if (op === Operation.ReduceScatter) {
       addStep('NVLS ReduceScatter: In-switch reduction with scattered output', 'init');
       currentTime += 300;
 
-      addStep('All GPUs write chunks to multicast object', 'scatter');
+      addStep('All GPUs issue multimem.ld_reduce to send chunks to switch', 'scatter');
       for (let gpu = 0; gpu < NODE_COUNT; gpu++) {
         events.push({
           type: 'to-switch',
@@ -463,13 +435,13 @@ const generateTimeline = (op, algo, topo) => {
       }
       currentTime += MULTICAST_TIME;
 
-      addStep('NVSwitch performs reduction per chunk', 'switch-reduce');
+      addStep('NVSwitch SHARP ALUs perform reduction per chunk', 'switch-reduce');
       for (let c = 0; c < NODE_COUNT; c++) {
         addSwitchReduce(Array.from({ length: NODE_COUNT }, (_, i) => i), c, `Σ${c}`);
       }
       currentTime += SWITCH_COMPUTE_TIME;
 
-      addStep('Each GPU reads only its owned reduced chunk', 'gather');
+      addStep('Switch routes reduced chunk i to GPU i (scatter addressing)', 'gather');
       for (let gpu = 0; gpu < NODE_COUNT; gpu++) {
         events.push({
           type: 'from-switch-single',
@@ -485,13 +457,13 @@ const generateTimeline = (op, algo, topo) => {
       }
       currentTime += MULTICAST_TIME * 0.3;
 
-      addStep('Complete! Each GPU owns fully reduced chunk i', 'done');
+      addStep('Complete! Each GPU owns fully reduced chunk i. Critical for Tensor Parallelism.', 'done');
     }
     else if (op === Operation.AllGather) {
       addStep('NVLS AllGather: NVSwitch multicast amplifies data to all GPUs', 'init');
       currentTime += 300;
 
-      addStep('Each GPU writes its unique chunk to multicast object', 'scatter');
+      addStep('Each GPU issues multimem.st_multicast to write chunk to multicast address', 'scatter');
       for (let gpu = 0; gpu < NODE_COUNT; gpu++) {
         events.push({
           type: 'to-switch',
@@ -506,7 +478,7 @@ const generateTimeline = (op, algo, topo) => {
       }
       currentTime += MULTICAST_TIME;
 
-      addStep('NVSwitch broadcasts all chunks to all GPUs via multicast', 'broadcast');
+      addStep('NVSwitch replicates all chunks to all GPUs via multicast', 'broadcast');
       events.push({
         type: 'switch-broadcast',
         id: `sb-${events.length}`,
@@ -523,14 +495,14 @@ const generateTimeline = (op, algo, topo) => {
         }));
       }
 
-      addStep('Complete! Data amplified by switch - each GPU sent 1/N, received all', 'done');
+      addStep('Complete! NOTE: Ring may achieve higher BW (~350 vs ~300 GB/s) due to TX/RX saturation. NVLS wins on latency.', 'done');
     }
     else if (op === Operation.Broadcast) {
-      addStep('NVLS Broadcast: Single write to multicast address → all GPUs receive', 'init');
+      addStep('NVLS Broadcast: Single multimem.st_multicast from root → all GPUs receive', 'init');
       bufferState[0] = [{ chunkId: 0, state: 'source', reductionCount: 1 }];
       currentTime += 300;
 
-      addStep('Root writes to multicast object (single NVLink transaction)', 'send');
+      addStep('Root issues multimem.st_multicast (single NVLink transaction)', 'send');
       events.push({
         type: 'to-switch',
         id: `ts-${events.length}`,
@@ -543,7 +515,7 @@ const generateTimeline = (op, algo, topo) => {
       });
       currentTime += MULTICAST_TIME;
 
-      addStep('NVSwitch multicast duplicates data to all GPUs simultaneously', 'multicast');
+      addStep('NVSwitch multicast replicates packet to all output ports simultaneously', 'multicast');
       events.push({
         type: 'from-switch',
         id: `fs-${events.length}`,
@@ -560,13 +532,13 @@ const generateTimeline = (op, algo, topo) => {
         bufferState[i] = [{ chunkId: 0, state: 'final', reductionCount: 1 }];
       }
 
-      addStep('Complete! O(1) latency broadcast via switch multicast', 'done');
+      addStep('Complete! True O(1) complexity broadcast via hardware multicast', 'done');
     }
     else if (op === Operation.Reduce) {
-      addStep('NVLS Reduce: In-switch reduction, result only to root', 'init');
+      addStep('NVLS Reduce: Native SHARP reduction - solves incast problem', 'init');
       currentTime += 300;
 
-      addStep('All GPUs write to multicast object', 'scatter');
+      addStep('All GPUs issue multimem.ld_reduce to send data to switch', 'scatter');
       for (let gpu = 0; gpu < NODE_COUNT; gpu++) {
         events.push({
           type: 'to-switch',
@@ -581,11 +553,11 @@ const generateTimeline = (op, algo, topo) => {
       }
       currentTime += MULTICAST_TIME;
 
-      addStep('NVSwitch performs in-fabric reduction', 'switch-reduce');
+      addStep('NVSwitch SHARP ALUs perform in-fabric reduction', 'switch-reduce');
       addSwitchReduce(Array.from({ length: NODE_COUNT }, (_, i) => i), 0, 'Σ');
       currentTime += SWITCH_COMPUTE_TIME;
 
-      addStep('Only root reads the reduced result', 'gather');
+      addStep('Only root receives the single reduced result (no incast!)', 'gather');
       events.push({
         type: 'from-switch-single',
         id: `fss-${events.length}`,
@@ -603,198 +575,23 @@ const generateTimeline = (op, algo, topo) => {
         bufferState[i] = [{ chunkId: i, state: 'sent', reductionCount: 1 }];
       }
 
-      addStep('Complete! In-switch reduction - minimal GPU compute needed', 'done');
+      addStep('Complete! Incast eliminated - root receives 1 stream, not N-1. No MultiShot needed (already optimal).', 'done');
     }
-    else if (op === Operation.AllToAll) {
-      addStep('NVLS AllToAll: Leverages NVSwitch full-mesh connectivity', 'init');
-      // Initialize buffer state
-      for (let i = 0; i < NODE_COUNT; i++) {
-        bufferState[i] = Array.from({ length: NODE_COUNT }, (_, j) => ({
-          chunkId: j,
-          state: i === j ? 'local' : 'to-send',
-          destGpu: j,
-          reductionCount: 1
-        }));
-      }
-      saveBufferSnapshot();
-      currentTime += 300;
-
-      addStep('Phase 1: All GPUs write their outbound chunks to NVSwitch fabric simultaneously', 'scatter');
-      
-      // Each GPU sends all its chunks through switch
-      for (let gpu = 0; gpu < NODE_COUNT; gpu++) {
-        events.push({
-          type: 'to-switch-multi',
-          id: `tsm-${events.length}`,
-          from: gpu,
-          chunks: Array.from({ length: NODE_COUNT }, (_, j) => j).filter(j => j !== gpu),
-          color: CHUNK_COLORS[gpu % CHUNK_COLORS.length],
-          startTime: currentTime,
-          duration: MULTICAST_TIME,
-          label: `G${gpu}→*`
-        });
-      }
-      currentTime += MULTICAST_TIME;
-
-      addStep('Phase 2: NVSwitch routes each chunk to correct destination (crossbar switching)', 'route');
-      
-      // Switch routing visualization
-      events.push({
-        type: 'switch-route',
-        id: `sr-${events.length}`,
-        startTime: currentTime,
-        duration: SWITCH_COMPUTE_TIME * 0.5,
-        label: 'ROUTING'
-      });
-      currentTime += SWITCH_COMPUTE_TIME * 0.5;
-
-      addStep('Phase 3: All GPUs receive their destined chunks from switch', 'gather');
-      
-      for (let gpu = 0; gpu < NODE_COUNT; gpu++) {
-        events.push({
-          type: 'from-switch-gather',
-          id: `fsg-${events.length}`,
-          destination: gpu,
-          sources: Array.from({ length: NODE_COUNT }, (_, j) => j).filter(j => j !== gpu),
-          color: CHUNK_COLORS[gpu % CHUNK_COLORS.length],
-          startTime: currentTime,
-          duration: MULTICAST_TIME,
-          label: `*→G${gpu}`
-        });
-      }
-      currentTime += MULTICAST_TIME;
-
-      // Final state
-      for (let i = 0; i < NODE_COUNT; i++) {
-        bufferState[i] = Array.from({ length: NODE_COUNT }, (_, j) => ({
-          chunkId: j,
-          state: 'final',
-          fromGpu: j,
-          reductionCount: 1
-        }));
-      }
-
-      addStep('Complete! NVSwitch crossbar enables full bisection bandwidth for AllToAll', 'done');
-    }
+    // NOTE: AllToAll with NVLS is NOT supported - NVLS is for reduction/replication, not routing
   }
   // === MULTISHOT (2-Shot AllReduce) ===
   else if (algo === Algorithm.MultiShot) {
     if (op === Operation.AllReduce) {
-      addStep('MultiShot AllReduce: O(2) latency regardless of GPU count!', 'init');
+      addStep('MultiShot AllReduce: O(2) latency via NVLS primitives. Decomposed into ReduceScatter + AllGather.', 'init');
       currentTime += 300;
 
-      addStep('SHOT 1 (ReduceScatter): All GPUs send slices to respective owners simultaneously', 'shot1');
+      addStep('SHOT 1 (ReduceScatter via NVLS): All GPUs issue multimem.ld_reduce for their chunks', 'shot1');
       
-      // Each GPU sends its chunk portion to the owning GPU
-      // All transfers happen in parallel
-      for (let owner = 0; owner < NODE_COUNT; owner++) {
-        for (let src = 0; src < NODE_COUNT; src++) {
-          if (src !== owner) {
-            events.push({
-              type: 'parallel-transfer',
-              id: `pt-${events.length}`,
-              from: src,
-              to: owner,
-              chunkId: owner,
-              color: CHUNK_COLORS[owner % CHUNK_COLORS.length],
-              startTime: currentTime,
-              duration: TRANSFER_TIME * 0.6,
-              label: `→${owner}`
-            });
-          }
-        }
-      }
-      
-      // Record full bandwidth utilization (all links active)
-      for (let i = 0; i < NODE_COUNT; i++) {
-        bandwidthSamples.push({
-          time: currentTime,
-          endTime: currentTime + TRANSFER_TIME * 0.6,
-          linkId: `all-to-${i}`,
-          utilization: 1.0,
-          isParallel: true
-        });
-      }
-      
-      currentTime += TRANSFER_TIME * 0.6;
-
-      addStep('Local reduction: Each GPU sums received slices for its owned chunk', 'local-reduce');
-      for (let gpu = 0; gpu < NODE_COUNT; gpu++) {
-        addCompute(gpu, 'Σ', COMPUTE_TIME * 0.5);
-        bufferState[gpu] = [{ chunkId: gpu, state: 'reduced', reductionCount: NODE_COUNT }];
-      }
-      currentTime += COMPUTE_TIME * 0.5;
-      saveBufferSnapshot();
-
-      addStep('SHOT 2 (AllGather via Multicast): Each GPU broadcasts its reduced slice', 'shot2');
-      
-      // Each GPU multicasts its reduced chunk to all others
-      // NVSwitch amplifies - GPU sends once, switch duplicates
+      // All GPUs send their data to switch - switch does the reduction!
       for (let gpu = 0; gpu < NODE_COUNT; gpu++) {
         events.push({
-          type: 'multicast-out',
-          id: `mco-${events.length}`,
-          from: gpu,
-          chunkId: gpu,
-          color: CHUNK_COLORS[gpu % CHUNK_COLORS.length],
-          startTime: currentTime,
-          duration: MULTICAST_TIME,
-          label: `Σ${gpu}`
-        });
-      }
-      currentTime += MULTICAST_TIME;
-
-      // All GPUs now have all reduced chunks
-      for (let i = 0; i < NODE_COUNT; i++) {
-        bufferState[i] = Array.from({ length: NODE_COUNT }, (_, c) => ({
-          chunkId: c, state: 'final', reductionCount: NODE_COUNT
-        }));
-      }
-
-      addStep('Complete! 2 communication steps total. ~3× faster than Ring for small messages!', 'done');
-    }
-    else if (op === Operation.ReduceScatter) {
-      addStep('MultiShot ReduceScatter: Single parallel scatter phase', 'init');
-      currentTime += 300;
-
-      addStep('All GPUs send slices to respective owners (parallel all-to-all)', 'scatter');
-      for (let owner = 0; owner < NODE_COUNT; owner++) {
-        for (let src = 0; src < NODE_COUNT; src++) {
-          if (src !== owner) {
-            events.push({
-              type: 'parallel-transfer',
-              id: `pt-${events.length}`,
-              from: src,
-              to: owner,
-              chunkId: owner,
-              color: CHUNK_COLORS[owner % CHUNK_COLORS.length],
-              startTime: currentTime,
-              duration: TRANSFER_TIME * 0.6,
-              label: `→${owner}`
-            });
-          }
-        }
-      }
-      currentTime += TRANSFER_TIME * 0.6;
-
-      addStep('Local reduction at each GPU', 'reduce');
-      for (let gpu = 0; gpu < NODE_COUNT; gpu++) {
-        addCompute(gpu, 'Σ', COMPUTE_TIME * 0.5);
-        bufferState[gpu] = [{ chunkId: gpu, state: 'reduced', reductionCount: NODE_COUNT }];
-      }
-      currentTime += COMPUTE_TIME * 0.5;
-
-      addStep('Complete! Single communication step', 'done');
-    }
-    else if (op === Operation.AllGather) {
-      addStep('MultiShot AllGather: Single multicast phase', 'init');
-      currentTime += 300;
-
-      addStep('All GPUs multicast their chunks simultaneously via NVSwitch', 'multicast');
-      for (let gpu = 0; gpu < NODE_COUNT; gpu++) {
-        events.push({
-          type: 'multicast-out',
-          id: `mco-${events.length}`,
+          type: 'to-switch',
+          id: `ts-${events.length}`,
           from: gpu,
           chunkId: gpu,
           color: CHUNK_COLORS[gpu % CHUNK_COLORS.length],
@@ -805,6 +602,142 @@ const generateTimeline = (op, algo, topo) => {
       }
       currentTime += MULTICAST_TIME;
 
+      addStep('NVSwitch SHARP ALUs perform IN-SWITCH reduction (not on GPUs!)', 'switch-reduce');
+      
+      // Switch performs reduction - THIS IS THE KEY DIFFERENCE
+      for (let c = 0; c < NODE_COUNT; c++) {
+        addSwitchReduce(Array.from({ length: NODE_COUNT }, (_, i) => i), c, `Σ${c}`);
+      }
+      currentTime += SWITCH_COMPUTE_TIME;
+
+      // Reduced chunks scattered to owners
+      addStep('Switch routes reduced chunk i to GPU i (ReduceScatter complete)', 'scatter-result');
+      for (let gpu = 0; gpu < NODE_COUNT; gpu++) {
+        events.push({
+          type: 'from-switch-single',
+          id: `fss-${events.length}`,
+          destination: gpu,
+          chunkId: gpu,
+          color: CHUNK_COLORS[gpu % CHUNK_COLORS.length],
+          startTime: currentTime,
+          duration: MULTICAST_TIME * 0.5,
+          label: `Σ${gpu}`
+        });
+        bufferState[gpu] = [{ chunkId: gpu, state: 'reduced', reductionCount: NODE_COUNT }];
+      }
+      currentTime += MULTICAST_TIME * 0.5;
+      saveBufferSnapshot();
+
+      addStep('SHOT 2 (AllGather via NVLS): Each GPU issues multimem.st_multicast for its reduced chunk', 'shot2');
+      
+      // Each GPU multicasts its reduced chunk via switch
+      for (let gpu = 0; gpu < NODE_COUNT; gpu++) {
+        events.push({
+          type: 'to-switch',
+          id: `ts2-${events.length}`,
+          from: gpu,
+          chunkId: gpu,
+          color: CHUNK_COLORS[gpu % CHUNK_COLORS.length],
+          startTime: currentTime,
+          duration: MULTICAST_TIME * 0.5,
+          label: `Σ${gpu}`
+        });
+      }
+      currentTime += MULTICAST_TIME * 0.5;
+
+      addStep('NVSwitch multicasts all reduced chunks to all GPUs', 'broadcast');
+      events.push({
+        type: 'switch-broadcast',
+        id: `sb-${events.length}`,
+        destinations: Array.from({ length: NODE_COUNT }, (_, i) => i),
+        startTime: currentTime,
+        duration: MULTICAST_TIME,
+        label: 'ALL'
+      });
+      currentTime += MULTICAST_TIME;
+
+      // All GPUs now have all reduced chunks
+      for (let i = 0; i < NODE_COUNT; i++) {
+        bufferState[i] = Array.from({ length: NODE_COUNT }, (_, c) => ({
+          chunkId: c, state: 'final', reductionCount: NODE_COUNT
+        }));
+      }
+
+      addStep('Complete! 2 shots total. ~3× faster than Ring for small messages. SM offload achieved!', 'done');
+    }
+    else if (op === Operation.ReduceScatter) {
+      addStep('MultiShot ReduceScatter: Single shot via NVLS (Phase 1 of MultiShot AllReduce)', 'init');
+      currentTime += 300;
+
+      addStep('All GPUs issue multimem.ld_reduce to send data to switch', 'scatter');
+      for (let gpu = 0; gpu < NODE_COUNT; gpu++) {
+        events.push({
+          type: 'to-switch',
+          id: `ts-${events.length}`,
+          from: gpu,
+          chunkId: gpu,
+          color: CHUNK_COLORS[gpu % CHUNK_COLORS.length],
+          startTime: currentTime,
+          duration: MULTICAST_TIME,
+          label: `C${gpu}`
+        });
+      }
+      currentTime += MULTICAST_TIME;
+
+      addStep('NVSwitch SHARP ALUs perform in-switch reduction', 'switch-reduce');
+      for (let c = 0; c < NODE_COUNT; c++) {
+        addSwitchReduce(Array.from({ length: NODE_COUNT }, (_, i) => i), c, `Σ${c}`);
+      }
+      currentTime += SWITCH_COMPUTE_TIME;
+
+      addStep('Switch routes reduced chunk i to GPU i', 'scatter-result');
+      for (let gpu = 0; gpu < NODE_COUNT; gpu++) {
+        events.push({
+          type: 'from-switch-single',
+          id: `fss-${events.length}`,
+          destination: gpu,
+          chunkId: gpu,
+          color: CHUNK_COLORS[gpu % CHUNK_COLORS.length],
+          startTime: currentTime,
+          duration: MULTICAST_TIME * 0.3,
+          label: `Σ${gpu}`
+        });
+        bufferState[gpu] = [{ chunkId: gpu, state: 'reduced', reductionCount: NODE_COUNT }];
+      }
+      currentTime += MULTICAST_TIME * 0.3;
+
+      addStep('Complete! Single communication step via NVLS. Critical for TP efficiency.', 'done');
+    }
+    else if (op === Operation.AllGather) {
+      addStep('MultiShot AllGather: Single shot via NVLS multicast (Phase 2 of MultiShot AllReduce)', 'init');
+      currentTime += 300;
+
+      addStep('All GPUs issue multimem.st_multicast for their chunks', 'multicast');
+      for (let gpu = 0; gpu < NODE_COUNT; gpu++) {
+        events.push({
+          type: 'to-switch',
+          id: `ts-${events.length}`,
+          from: gpu,
+          chunkId: gpu,
+          color: CHUNK_COLORS[gpu % CHUNK_COLORS.length],
+          startTime: currentTime,
+          duration: MULTICAST_TIME,
+          label: `C${gpu}`
+        });
+      }
+      currentTime += MULTICAST_TIME;
+
+      addStep('NVSwitch multicasts all chunks to all GPUs simultaneously', 'broadcast');
+      events.push({
+        type: 'switch-broadcast',
+        id: `sb-${events.length}`,
+        destinations: Array.from({ length: NODE_COUNT }, (_, i) => i),
+        startTime: currentTime,
+        duration: MULTICAST_TIME,
+        label: 'ALL'
+      });
+      currentTime += MULTICAST_TIME;
+
       for (let i = 0; i < NODE_COUNT; i++) {
         bufferState[i] = Array.from({ length: NODE_COUNT }, (_, c) => ({
           chunkId: c, state: 'final', reductionCount: 1
@@ -813,110 +746,8 @@ const generateTimeline = (op, algo, topo) => {
 
       addStep('Complete! Single step via switch multicast amplification', 'done');
     }
-    else if (op === Operation.Broadcast) {
-      addStep('MultiShot Broadcast: Single multicast from root', 'init');
-      bufferState[0] = [{ chunkId: 0, state: 'source', reductionCount: 1 }];
-      currentTime += 300;
-
-      addStep('Root multicasts to all GPUs via NVSwitch', 'multicast');
-      addMulticast(0, Array.from({ length: NODE_COUNT }, (_, i) => i), 0, 'Data');
-      currentTime += MULTICAST_TIME;
-
-      for (let i = 0; i < NODE_COUNT; i++) {
-        bufferState[i] = [{ chunkId: 0, state: 'final', reductionCount: 1 }];
-      }
-
-      addStep('Complete! O(1) latency broadcast', 'done');
-    }
-    else if (op === Operation.Reduce) {
-      addStep('MultiShot Reduce: Parallel gather + local reduction at root', 'init');
-      currentTime += 300;
-
-      addStep('All GPUs send to root in parallel', 'gather');
-      for (let src = 1; src < NODE_COUNT; src++) {
-        events.push({
-          type: 'parallel-transfer',
-          id: `pt-${events.length}`,
-          from: src,
-          to: 0,
-          chunkId: src,
-          color: CHUNK_COLORS[src % CHUNK_COLORS.length],
-          startTime: currentTime,
-          duration: TRANSFER_TIME * 0.8,
-          label: `D${src}`
-        });
-      }
-      currentTime += TRANSFER_TIME * 0.8;
-
-      addStep('Root reduces all received data', 'reduce');
-      addCompute(0, 'Σ', COMPUTE_TIME);
-      currentTime += COMPUTE_TIME;
-
-      bufferState[0] = [{ chunkId: 'all', state: 'reduced', reductionCount: NODE_COUNT }];
-      for (let i = 1; i < NODE_COUNT; i++) {
-        bufferState[i] = [{ chunkId: i, state: 'sent', reductionCount: 1 }];
-      }
-
-      addStep('Complete! Still O(1) communication, O(N) reduction at root', 'done');
-    }
-    else if (op === Operation.AllToAll) {
-      addStep('MultiShot AllToAll: Parallel personalized exchange via NVSwitch', 'init');
-      // Initialize buffer state
-      for (let i = 0; i < NODE_COUNT; i++) {
-        bufferState[i] = Array.from({ length: NODE_COUNT }, (_, j) => ({
-          chunkId: j,
-          state: i === j ? 'local' : 'to-send',
-          destGpu: j,
-          reductionCount: 1
-        }));
-      }
-      saveBufferSnapshot();
-      currentTime += 300;
-
-      addStep('All GPUs exchange personalized data simultaneously (full bisection BW)', 'exchange');
-      
-      // Parallel personalized exchange - every GPU sends unique data to every other
-      for (let src = 0; src < NODE_COUNT; src++) {
-        for (let dst = 0; dst < NODE_COUNT; dst++) {
-          if (src !== dst) {
-            events.push({
-              type: 'parallel-transfer',
-              id: `pt-${events.length}`,
-              from: src,
-              to: dst,
-              chunkId: src * NODE_COUNT + dst,
-              color: CHUNK_COLORS[src % CHUNK_COLORS.length],
-              startTime: currentTime,
-              duration: TRANSFER_TIME * 0.5,
-              label: `${src}→${dst}`
-            });
-          }
-        }
-      }
-      
-      // Full bandwidth utilization
-      bandwidthSamples.push({
-        time: currentTime,
-        endTime: currentTime + TRANSFER_TIME * 0.5,
-        linkId: 'full-mesh',
-        utilization: 1.0,
-        isParallel: true
-      });
-      
-      currentTime += TRANSFER_TIME * 0.5;
-
-      // Final state
-      for (let i = 0; i < NODE_COUNT; i++) {
-        bufferState[i] = Array.from({ length: NODE_COUNT }, (_, j) => ({
-          chunkId: j,
-          state: 'final',
-          fromGpu: j,
-          reductionCount: 1
-        }));
-      }
-
-      addStep('Complete! Single step AllToAll leveraging NVSwitch full-mesh topology', 'done');
-    }
+    // NOTE: MultiShot Reduce is NOT a thing - NVLS Reduce is already single-shot optimal
+    // NOTE: MultiShot AllToAll is NOT a thing - cannot be decomposed into RS+AG
   }
   // === RING ALGORITHMS ===
   else if (algo === Algorithm.Ring || algo === Algorithm.BiRing) {
@@ -977,6 +808,7 @@ const generateTimeline = (op, algo, topo) => {
 
         currentTime += maxDuration;
 
+        // SM-based reduction (the cost NVLS eliminates)
         for (let gpu = 0; gpu < NODE_COUNT; gpu++) {
           addCompute(gpu, '+', COMPUTE_TIME * 0.5);
         }
@@ -1069,12 +901,11 @@ const generateTimeline = (op, algo, topo) => {
 
       const bwNote = isBidirectional
         ? 'Bidirectional achieves 2× bandwidth utilization!'
-        : 'Data moved: 2×(N-1)/N × Size (bandwidth optimal)';
+        : 'Data moved: 2×(N-1)/N × Size (bandwidth optimal but O(N) latency, SM reduction overhead)';
       addStep(`AllReduce Complete! ${bwNote}`, 'done');
     }
     else if (op === Operation.AllToAll) {
       addStep('Ring AllToAll: Pipelined personalized exchange around the ring', 'init');
-      // Initialize buffer state
       for (let i = 0; i < NODE_COUNT; i++) {
         bufferState[i] = Array.from({ length: NODE_COUNT }, (_, j) => ({
           chunkId: j,
@@ -1102,7 +933,6 @@ const generateTimeline = (op, algo, topo) => {
         let maxDuration = 0;
 
         for (let gpu = 0; gpu < NODE_COUNT; gpu++) {
-          // In ring AllToAll, GPU sends data destined for GPU at distance (step+1)
           const destGpuCW = (gpu + step + 1) % NODE_COUNT;
           const sendToCW = ringNext(gpu);
 
@@ -1121,7 +951,6 @@ const generateTimeline = (op, algo, topo) => {
 
         currentTime += maxDuration;
 
-        // Update buffer state - track received chunks
         for (let gpu = 0; gpu < NODE_COUNT; gpu++) {
           const receivedFrom = (gpu - step - 1 + NODE_COUNT) % NODE_COUNT;
           bufferState[gpu] = bufferState[gpu].map(chunk => {
@@ -1134,7 +963,6 @@ const generateTimeline = (op, algo, topo) => {
         saveBufferSnapshot();
       }
 
-      // Final state
       for (let i = 0; i < NODE_COUNT; i++) {
         bufferState[i] = Array.from({ length: NODE_COUNT }, (_, j) => ({
           chunkId: j,
@@ -1146,12 +974,11 @@ const generateTimeline = (op, algo, topo) => {
 
       const bwNote = isBidirectional
         ? 'Bidirectional halves the number of steps!'
-        : 'N-1 steps to complete personalized exchange';
+        : 'N-1 steps. NOTE: NVLS/MultiShot NOT applicable - AllToAll is routing, not reduction/replication.';
       addStep(`AllToAll Complete! ${bwNote}`, 'done');
     }
     else if (op === Operation.Reduce || op === Operation.Broadcast || 
              op === Operation.AllGather || op === Operation.ReduceScatter) {
-      // Simplified ring implementations for other ops
       addStep(`Ring ${op}: Standard ring algorithm`, 'init');
       currentTime += 300;
       
@@ -1479,12 +1306,25 @@ const App = () => {
 
   const lastTimeRef = useRef(0);
 
+  // Get compatible algorithms for current operation
+  const compatibleAlgorithms = ALGORITHM_COMPATIBILITY[operation] || [];
+
+  // Auto-select compatible algorithm when operation changes
   useEffect(() => {
-    const tl = generateTimeline(operation, algorithm, topology);
-    setTimeline(tl);
-    setProgress(0);
-    setIsPlaying(false);
-  }, [operation, algorithm, topology]);
+    if (!compatibleAlgorithms.includes(algorithm)) {
+      setAlgorithm(compatibleAlgorithms[0] || Algorithm.Ring);
+    }
+  }, [operation, compatibleAlgorithms, algorithm]);
+
+  useEffect(() => {
+    // Only generate timeline if algorithm is compatible
+    if (compatibleAlgorithms.includes(algorithm)) {
+      const tl = generateTimeline(operation, algorithm, topology);
+      setTimeline(tl);
+      setProgress(0);
+      setIsPlaying(false);
+    }
+  }, [operation, algorithm, topology, compatibleAlgorithms]);
 
   useEffect(() => {
     let animationFrameId;
@@ -1667,31 +1507,66 @@ const App = () => {
           <div className="flex flex-col gap-1.5">
             {Object.values(Algorithm).map(algo => {
               const isHopper = algo === Algorithm.NVLS || algo === Algorithm.MultiShot;
+              const isCompatible = compatibleAlgorithms.includes(algo);
+              const isSelected = algorithm === algo;
+              
               return (
                 <button
                   key={algo}
-                  onClick={() => setAlgorithm(algo)}
+                  onClick={() => isCompatible && setAlgorithm(algo)}
+                  disabled={!isCompatible}
                   className={clsx(
                     "p-2 text-xs rounded border text-left transition-all flex items-center gap-2",
-                    algorithm === algo
-                      ? isHopper 
-                        ? "bg-violet-500/20 border-violet-500 text-violet-300"
-                        : "bg-blue-500/20 border-blue-500 text-blue-300"
-                      : "bg-slate-800 border-slate-700 text-slate-400 hover:bg-slate-700"
+                    !isCompatible 
+                      ? "bg-slate-900 border-slate-800 text-slate-600 cursor-not-allowed opacity-50"
+                      : isSelected
+                        ? isHopper 
+                          ? "bg-violet-500/20 border-violet-500 text-violet-300"
+                          : "bg-blue-500/20 border-blue-500 text-blue-300"
+                        : "bg-slate-800 border-slate-700 text-slate-400 hover:bg-slate-700"
                   )}
                 >
                   <div className={clsx(
                     "w-1.5 h-1.5 rounded-full", 
-                    algorithm === algo 
-                      ? isHopper ? "bg-violet-400" : "bg-blue-400" 
-                      : "bg-slate-600"
+                    !isCompatible
+                      ? "bg-slate-700"
+                      : isSelected 
+                        ? isHopper ? "bg-violet-400" : "bg-blue-400" 
+                        : "bg-slate-600"
                   )} />
                   <span className="flex-1">{algo}</span>
-                  {isHopper && <Cpu size={12} className="text-violet-400" />}
+                  {isHopper && <Cpu size={12} className={isCompatible ? "text-violet-400" : "text-slate-700"} />}
+                  {!isCompatible && (
+                    <AlertTriangle size={12} className="text-amber-500/50" title="Not applicable for this operation" />
+                  )}
                 </button>
               );
             })}
           </div>
+          
+          {/* Compatibility note */}
+          {operation === Operation.AllToAll && (
+            <div className="mt-2 p-2 bg-amber-900/20 border border-amber-700/30 rounded text-[9px] text-amber-300/80">
+              <div className="flex items-start gap-1.5">
+                <AlertTriangle size={10} className="mt-0.5 flex-shrink-0" />
+                <span>
+                  <strong>AllToAll</strong> uses NVSwitch for <em>routing bandwidth</em> only. 
+                  NVLS/MultiShot require reduction or replication semantics - AllToAll is point-to-point distinct data.
+                </span>
+              </div>
+            </div>
+          )}
+          {operation === Operation.Reduce && (
+            <div className="mt-2 p-2 bg-violet-900/20 border border-violet-700/30 rounded text-[9px] text-violet-300/80">
+              <div className="flex items-start gap-1.5">
+                <Zap size={10} className="mt-0.5 flex-shrink-0" />
+                <span>
+                  <strong>Reduce</strong> is natively optimal via NVLS (single-shot). 
+                  MultiShot is only for symmetric operations requiring RS+AG decomposition.
+                </span>
+              </div>
+            </div>
+          )}
         </div>
 
         {/* Current Step */}
@@ -2025,70 +1900,37 @@ const App = () => {
                   );
                 });
               }
-              if (evt.type === 'multicast-out' && evt.from !== undefined) {
-                const gpu = nodes.find(n => n.id === evt.from);
-                if (!gpu) return null;
-                // Show multicast going out from this GPU to all others
-                return nodes.filter(n => n.id !== evt.from).map((dest, j) => {
-                  const t = evt.t;
-                  const x = gpu.x + (dest.x - gpu.x) * t;
-                  const y = gpu.y + (dest.y - gpu.y) * t;
-                  return (
-                    <g key={`mco-${i}-${j}`}>
-                      <line x1={gpu.x} y1={gpu.y} x2={dest.x} y2={dest.y}
-                        className="stroke-violet-400" strokeWidth={1} opacity={0.3} />
-                      <circle cx={x} cy={y} r={5} fill={evt.color} opacity={0.8} />
-                    </g>
-                  );
-                });
-              }
-              // AllToAll: GPU sends multiple chunks to switch
-              if (evt.type === 'to-switch-multi' && evt.from !== undefined) {
-                const gpu = nodes.find(n => n.id === evt.from);
-                if (!gpu) return null;
-                const t = evt.t;
-                const x = gpu.x + (switchX - gpu.x) * t;
-                const y = gpu.y + (switchY - gpu.y) * t;
-                return (
-                  <g key={`tsm-${i}`}>
-                    <line x1={gpu.x} y1={gpu.y} x2={switchX} y2={switchY} 
-                      className="stroke-violet-400" strokeWidth={2} strokeDasharray="4 2" opacity={0.5} />
-                    <circle cx={x} cy={y} r={10} fill={evt.color} filter="url(#glow-strong)" />
-                    <text x={x} y={y - 14} textAnchor="middle" className="fill-white text-[8px] font-bold">
-                      {evt.label}
-                    </text>
-                  </g>
-                );
-              }
-              // AllToAll: Switch routes to destinations
-              if (evt.type === 'switch-route') {
-                return (
-                  <g key={`sr-${i}`} transform={`translate(${switchX}, ${switchY})`}>
-                    <circle r={45} fill="none" className="stroke-violet-400" strokeWidth={2} 
-                      strokeDasharray="8 4" opacity={0.8}>
-                      <animateTransform attributeName="transform" type="rotate" 
-                        from="0" to="360" dur="1s" repeatCount="indefinite" />
-                    </circle>
-                  </g>
-                );
-              }
-              // AllToAll: GPU receives gathered chunks from switch
-              if (evt.type === 'from-switch-gather' && evt.destination !== undefined) {
+              if (evt.type === 'from-switch-single' && evt.destination !== undefined) {
                 const gpu = nodes.find(n => n.id === evt.destination);
                 if (!gpu) return null;
                 const t = evt.t;
                 const x = switchX + (gpu.x - switchX) * t;
                 const y = switchY + (gpu.y - switchY) * t;
                 return (
-                  <g key={`fsg-${i}`}>
+                  <g key={`fss-${i}`}>
                     <line x1={switchX} y1={switchY} x2={gpu.x} y2={gpu.y}
                       className="stroke-cyan-400" strokeWidth={2} strokeDasharray="4 2" opacity={0.5} />
-                    <circle cx={x} cy={y} r={10} fill={evt.color} filter="url(#glow-strong)" />
-                    <text x={x} y={y - 14} textAnchor="middle" className="fill-white text-[8px] font-bold">
+                    <circle cx={x} cy={y} r={7} fill={evt.color} filter="url(#glow-strong)" />
+                    <text x={x} y={y - 12} textAnchor="middle" className="fill-white text-[8px] font-bold">
                       {evt.label}
                     </text>
                   </g>
                 );
+              }
+              if (evt.type === 'switch-broadcast') {
+                // Show broadcast lines to all GPUs
+                return nodes.map((gpu, j) => {
+                  const t = evt.t;
+                  const x = switchX + (gpu.x - switchX) * t;
+                  const y = switchY + (gpu.y - switchY) * t;
+                  return (
+                    <g key={`sb-${i}-${j}`}>
+                      <line x1={switchX} y1={switchY} x2={gpu.x} y2={gpu.y}
+                        className="stroke-green-400" strokeWidth={1.5} strokeDasharray="4 2" opacity={0.4} />
+                      <circle cx={x} cy={y} r={5} fill="#22c55e" opacity={0.8} />
+                    </g>
+                  );
+                });
               }
               return null;
             })}
@@ -2141,6 +1983,7 @@ const App = () => {
               const inSwitchActivity = activeSwitchEvents.some(e => 
                 e.from === node.id || 
                 (e.destinations && e.destinations.includes(node.id)) ||
+                (e.destination === node.id) ||
                 (e.sources && e.sources.includes(node.id))
               );
 
@@ -2198,11 +2041,9 @@ const App = () => {
             {(algorithm === Algorithm.NVLS || algorithm === Algorithm.MultiShot) && topology === Topology.SingleNode && (
               <g transform="translate(400, 520)">
                 <text x={0} y={0} textAnchor="middle" className="fill-violet-400 text-[10px] font-medium">
-                  {operation === Operation.AllToAll 
-                    ? '⚡ NVSwitch Crossbar Full-Mesh Exchange'
-                    : algorithm === Algorithm.NVLS 
-                      ? '⚡ NVSwitch In-Network Reduction' 
-                      : '⚡ 2-Shot via NVSwitch Multicast'}
+                  {algorithm === Algorithm.NVLS 
+                    ? '⚡ NVSwitch SHARP: In-Network Reduction + Multicast' 
+                    : '⚡ MultiShot: ReduceScatter (NVLS) + AllGather (NVLS)'}
                 </text>
               </g>
             )}
@@ -2223,7 +2064,7 @@ const App = () => {
             </div>
             <div className="flex items-center gap-1.5">
               <div className="w-3 h-3 rounded bg-slate-900 border-2 border-green-400"></div>
-              <span>Compute</span>
+              <span>SM Compute</span>
             </div>
             {isNVLSAlgo ? (
               <>
@@ -2233,7 +2074,7 @@ const App = () => {
                 </div>
                 <div className="flex items-center gap-1.5">
                   <Zap size={12} className="text-violet-300" />
-                  <span>In-Switch Op</span>
+                  <span>In-Switch Reduce</span>
                 </div>
               </>
             ) : (
