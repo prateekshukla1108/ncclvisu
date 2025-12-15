@@ -1,5 +1,5 @@
 import React, { useState, useEffect, useMemo, useRef } from 'react';
-import { Play, Pause, RotateCcw, Repeat, ChevronRight, ChevronLeft, Eye, EyeOff, BarChart3, Zap, Cpu, AlertTriangle } from 'lucide-react';
+import { Play, Pause, RotateCcw, Repeat, ChevronRight, ChevronLeft, Eye, EyeOff, BarChart3, Zap, Cpu, AlertTriangle, BookOpen, ChevronDown, ChevronUp } from 'lucide-react';
 
 // === TYPES & CONSTANTS ===
 const Operation = {
@@ -43,6 +43,212 @@ const CHUNK_COLORS = [
   '#f43f5e', '#84cc16', '#14b8a6', '#6366f1',
   '#a855f7', '#f59e0b', '#10b981', '#0ea5e9'
 ];
+
+// === KNOWLEDGE DATA ===
+// Mathematical and logical operation details for each operation/algorithm combination
+const KNOWLEDGE_DATA = {
+  operations: {
+    [Operation.AllReduce]: {
+      objective: 'Sum an array of size N across P GPUs so every GPU ends up with the full result.',
+      math: {
+        ring: {
+          phases: [
+            {
+              name: 'ReduceScatter (Phase 1)',
+              steps: 'P-1 steps',
+              operation: 'In step k, GPU i sends a chunk to GPU (i+1) and receives from GPU (i-1). The GPU adds the received data to its local buffer.',
+              result: 'Each GPU holds 1/P of the fully summed result (different slice per GPU).'
+            },
+            {
+              name: 'AllGather (Phase 2)',
+              steps: 'P-1 steps',
+              operation: 'GPUs circulate the fully summed chunks around the ring. No math performed, just copying.',
+              result: 'Every GPU acquires the missing P-1 chunks.'
+            }
+          ],
+          formula: 'Data split: N/P per chunk',
+          totalData: '2 · N · (P-1)/P → approaches 2N as P grows',
+          complexity: 'O(P) latency, 2(P-1) steps'
+        },
+        nvls: {
+          phases: [
+            { name: 'Push to Switch', operation: 'GPUs output data via multimem::red (Load Reduce) instruction' },
+            { name: 'Switch Math', operation: 'NVSwitch v3 ALUs perform summation (Σ) as packets fly through crossbar' },
+            { name: 'Broadcast', operation: 'Switch multicasts result to all GPUs via multimem::st' }
+          ],
+          complexity: 'O(1) latency (constant), 2 steps (Send + Receive)',
+          advantage: 'GPUs don\'t waste SM cycles - "fire and forget"'
+        }
+      }
+    },
+    [Operation.Reduce]: {
+      objective: 'Sum data from all GPUs onto a single root GPU.',
+      math: {
+        ring: {
+          phases: [
+            {
+              name: 'Gather Phase',
+              steps: 'P-1 steps',
+              operation: 'All GPUs send data to root. Sequential bottleneck at root.',
+              result: 'Root has all data, other GPUs sent their data.'
+            },
+            {
+              name: 'Compute Phase',
+              operation: 'Root computes sum of all gathered data.',
+              result: 'Only root holds the reduced result.'
+            }
+          ],
+          complexity: 'O(N) time due to root bottleneck'
+        },
+        nvls: {
+          phases: [
+            { name: 'Push to Switch', operation: 'All GPUs send to multicast address' },
+            { name: 'In-Fabric Reduce', operation: 'SHARP ALUs perform reduction' },
+            { name: 'Unicast to Root', operation: 'Result delivered only to root GPU' }
+          ],
+          complexity: 'O(1) latency, native single-shot operation'
+        }
+      }
+    },
+    [Operation.Broadcast]: {
+      objective: 'Distribute data from root GPU to all other GPUs.',
+      math: {
+        ring: {
+          phases: [
+            {
+              name: 'Tree Propagation',
+              operation: 'Root sends to neighbors, who forward to their neighbors.',
+              pattern: 'Node A → B/C → D/E/F/G',
+              complexity: 'L × log₂(P) latency'
+            }
+          ]
+        },
+        nvls: {
+          phases: [
+            { name: 'Root to Switch', operation: 'Root writes to multicast address' },
+            { name: 'Physical Multicast', operation: 'Switch copies 1 input to N ports electrically' }
+          ],
+          complexity: 'L × 1 (Switch Latency) - instant replication'
+        }
+      }
+    },
+    [Operation.AllGather]: {
+      objective: 'Gather N data from all GPUs onto every GPU (Output size: P × N).',
+      math: {
+        ring: {
+          phases: [
+            {
+              name: 'Ring Pass',
+              steps: 'P-1 steps',
+              operation: 'Simple ring circulation (same as Phase 2 of AllReduce)',
+              volume: 'Each GPU receives (P-1) × N data'
+            }
+          ]
+        },
+        nvls: {
+          phases: [
+            { name: 'Send to Switch', operation: 'Each GPU writes chunk to multicast address' },
+            { name: 'Multicast Amplify', operation: 'NVSwitch replicates all chunks to all GPUs' }
+          ],
+          note: 'Ring may achieve higher BW (~350 vs ~300 GB/s) due to TX/RX saturation. NVLS wins on latency.'
+        }
+      }
+    },
+    [Operation.ReduceScatter]: {
+      objective: 'Reduce data and scatter results so each GPU owns a unique reduced portion.',
+      math: {
+        ring: {
+          phases: [
+            {
+              name: 'Ring Reduction',
+              steps: 'P-1 steps',
+              operation: 'Each GPU sends portions to chunk owners. Owners reduce received data.',
+              result: 'GPU i owns fully reduced chunk i.'
+            }
+          ]
+        },
+        nvls: {
+          phases: [
+            { name: 'Send to Switch', operation: 'GPUs issue multimem.ld_reduce' },
+            { name: 'Per-Chunk Reduce', operation: 'SHARP ALUs perform reduction per chunk' },
+            { name: 'Scatter Addressing', operation: 'Switch routes reduced chunk i to GPU i' }
+          ],
+          note: 'Critical for Tensor Parallelism workloads.'
+        }
+      }
+    },
+    [Operation.AllToAll]: {
+      objective: 'Every GPU sends distinct data to every other GPU (Matrix Transpose).',
+      math: {
+        logic: 'If GPU i has input tensor T, it slices T into P blocks. Block j is sent to GPU j.',
+        dataMovement: 'N · (P-1)/P per GPU',
+        complexity: 'Purely bandwidth-bound; no arithmetic reduction involved.',
+        note: 'Uses NVSwitch for routing bandwidth only. NVLS/MultiShot require reduction or replication semantics.'
+      }
+    }
+  },
+  algorithms: {
+    [Algorithm.Naive]: {
+      name: 'Parameter Server',
+      description: 'Centralized approach with root bottleneck.',
+      pattern: 'Gather → Compute → Broadcast',
+      weakness: 'Root GPU becomes bandwidth bottleneck. O(N) scaling.'
+    },
+    [Algorithm.Ring]: {
+      name: 'Ring Algorithm',
+      description: 'Data flows in a single direction around the ring.',
+      advantage: 'Distributes bandwidth load evenly across all GPUs.',
+      steps: '2(P-1) total steps',
+      bandwidth: 'Approaches optimal: 2N data transferred'
+    },
+    [Algorithm.BiRing]: {
+      name: 'Bidirectional Ring',
+      description: 'Simultaneous clockwise and counter-clockwise data flow.',
+      advantage: 'Higher link utilization than unidirectional ring.',
+      bandwidth: 'Better saturation of full-duplex links'
+    },
+    [Algorithm.NVLS]: {
+      name: 'NVLink SHARP',
+      description: 'In-network computing via NVSwitch v3 hardware.',
+      hardware: 'SHARP ALUs: 400 GFlops FP32 compute inside switch',
+      advantage: 'Offloads reduction to switch. GPUs do zero math.',
+      bandwidth: '~480 GB/s AllReduce (vs ~370 GB/s Ring)',
+      complexity: 'O(1) latency - constant regardless of GPU count'
+    },
+    [Algorithm.MultiShot]: {
+      name: '2-Shot Algorithm',
+      description: 'Decomposes operation: ReduceScatter (Shot 1) + AllGather (Shot 2)',
+      advantage: 'Both phases leverage NVLS primitives.',
+      applicability: 'Only for symmetric operations (AllReduce, AllGather, ReduceScatter)',
+      complexity: 'O(2) latency'
+    }
+  },
+  hardware: {
+    h100: {
+      topology: {
+        nodes: '8× H100 GPUs per node',
+        interconnect: '4× NVSwitch v3 chips',
+        bandwidth: '900 GB/s bidirectional per GPU (18 NVLinks)',
+        connectivity: 'Fully Connected (Any-to-Any) - non-blocking fabric'
+      },
+      nvswitch: {
+        feature: 'In-Network Computing',
+        technology: 'SHARP (Scalable Hierarchical Aggregation and Reduction Protocol)',
+        capability: 'FP32 ALUs perform reduction mid-flight',
+        benefit: 'Eliminates O(P) dependency → O(1) for GPUs'
+      }
+    },
+    comparison: {
+      headers: ['Feature', 'Standard Ring', 'H100 NVLS'],
+      rows: [
+        ['Steps', '2(P-1)', '2'],
+        ['Latency', 'O(P) - Linear', 'O(1) - Constant'],
+        ['Compute', 'GPU Cores', 'Switch ALUs'],
+        ['Memory', 'Intermediate buffers', 'One-Shot (no GPU VRAM R/W)']
+      ]
+    }
+  }
+};
 
 // clsx utility
 const clsx = (...classes) => classes.filter(Boolean).join(' ');
@@ -1291,6 +1497,295 @@ const BufferStateView = ({ timeline, currentTime, nodeCount }) => {
   );
 };
 
+// === KNOWLEDGE PANEL COMPONENT ===
+const KnowledgePanel = ({ operation, algorithm }) => {
+  const [expandedSection, setExpandedSection] = useState('operation');
+
+  const opData = KNOWLEDGE_DATA.operations[operation];
+  const algoData = KNOWLEDGE_DATA.algorithms[algorithm];
+  const isNVLS = algorithm === Algorithm.NVLS || algorithm === Algorithm.MultiShot;
+
+  const getMathData = () => {
+    if (!opData?.math) return null;
+    if (operation === Operation.AllToAll) return opData.math;
+    if (isNVLS && opData.math.nvls) return opData.math.nvls;
+    if (opData.math.ring) return opData.math.ring;
+    return null;
+  };
+
+  const mathData = getMathData();
+
+  const toggleSection = (section) => {
+    setExpandedSection(expandedSection === section ? null : section);
+  };
+
+  return (
+    <div className="bg-slate-800/50 rounded-lg border border-slate-700 overflow-hidden">
+      <div className="text-xs text-slate-400 p-3 pb-2 flex items-center gap-2 border-b border-slate-700/50">
+        <BookOpen size={14} />
+        <span className="font-medium">Knowledge Base</span>
+      </div>
+
+      <div className="max-h-[400px] overflow-y-auto">
+        {/* Operation Section */}
+        <div className="border-b border-slate-700/50">
+          <button
+            onClick={() => toggleSection('operation')}
+            className="w-full p-2.5 flex items-center justify-between text-left hover:bg-slate-700/30 transition-colors"
+          >
+            <span className="text-[10px] font-semibold text-green-400 uppercase tracking-wider">
+              {operation}
+            </span>
+            {expandedSection === 'operation' ? <ChevronUp size={12} className="text-slate-500" /> : <ChevronDown size={12} className="text-slate-500" />}
+          </button>
+
+          {expandedSection === 'operation' && opData && (
+            <div className="px-3 pb-3 space-y-2">
+              <div className="text-[10px] text-slate-300 leading-relaxed">
+                <span className="text-slate-500">Objective:</span> {opData.objective}
+              </div>
+
+              {operation === Operation.AllToAll && opData.math && (
+                <div className="space-y-1.5">
+                  <div className="text-[9px] text-slate-400">
+                    <span className="text-amber-400/80">Logic:</span> {opData.math.logic}
+                  </div>
+                  <div className="text-[9px] text-slate-400">
+                    <span className="text-cyan-400/80">Data:</span> {opData.math.dataMovement}
+                  </div>
+                  <div className="text-[9px] text-slate-400">
+                    <span className="text-blue-400/80">Complexity:</span> {opData.math.complexity}
+                  </div>
+                  {opData.math.note && (
+                    <div className="text-[8px] text-amber-300/70 bg-amber-900/20 p-1.5 rounded border border-amber-700/30">
+                      {opData.math.note}
+                    </div>
+                  )}
+                </div>
+              )}
+
+              {mathData?.phases && (
+                <div className="space-y-1.5">
+                  <div className="text-[9px] text-slate-500 uppercase tracking-wider">Phases</div>
+                  {mathData.phases.map((phase, i) => (
+                    <div key={i} className={clsx(
+                      "p-2 rounded text-[9px] border",
+                      isNVLS ? "bg-violet-900/20 border-violet-700/30" : "bg-slate-700/30 border-slate-600/30"
+                    )}>
+                      <div className={clsx(
+                        "font-semibold mb-0.5",
+                        isNVLS ? "text-violet-300" : "text-blue-300"
+                      )}>
+                        {phase.name} {phase.steps && <span className="text-slate-500 font-normal">({phase.steps})</span>}
+                      </div>
+                      <div className="text-slate-400">{phase.operation}</div>
+                      {phase.result && <div className="text-slate-500 mt-0.5">→ {phase.result}</div>}
+                      {phase.pattern && <div className="text-slate-500 mt-0.5 font-mono">{phase.pattern}</div>}
+                      {phase.volume && <div className="text-slate-500 mt-0.5">{phase.volume}</div>}
+                    </div>
+                  ))}
+                </div>
+              )}
+
+              {mathData?.formula && (
+                <div className="text-[9px] text-cyan-400/80 font-mono bg-slate-900/50 p-1.5 rounded">
+                  {mathData.formula}
+                </div>
+              )}
+
+              {mathData?.totalData && (
+                <div className="text-[9px] text-slate-400">
+                  <span className="text-slate-500">Total Data:</span> <span className="font-mono">{mathData.totalData}</span>
+                </div>
+              )}
+
+              {mathData?.complexity && (
+                <div className={clsx(
+                  "text-[9px] p-1.5 rounded",
+                  isNVLS ? "bg-violet-900/30 text-violet-300" : "bg-blue-900/30 text-blue-300"
+                )}>
+                  <span className="text-slate-400">Complexity:</span> {mathData.complexity}
+                </div>
+              )}
+
+              {mathData?.advantage && (
+                <div className="text-[9px] text-green-400/80 bg-green-900/20 p-1.5 rounded border border-green-700/30">
+                  {mathData.advantage}
+                </div>
+              )}
+
+              {mathData?.note && (
+                <div className="text-[8px] text-slate-400 italic">
+                  {mathData.note}
+                </div>
+              )}
+            </div>
+          )}
+        </div>
+
+        {/* Algorithm Section */}
+        <div className="border-b border-slate-700/50">
+          <button
+            onClick={() => toggleSection('algorithm')}
+            className="w-full p-2.5 flex items-center justify-between text-left hover:bg-slate-700/30 transition-colors"
+          >
+            <span className={clsx(
+              "text-[10px] font-semibold uppercase tracking-wider",
+              isNVLS ? "text-violet-400" : "text-blue-400"
+            )}>
+              {algoData?.name || algorithm}
+            </span>
+            {expandedSection === 'algorithm' ? <ChevronUp size={12} className="text-slate-500" /> : <ChevronDown size={12} className="text-slate-500" />}
+          </button>
+
+          {expandedSection === 'algorithm' && algoData && (
+            <div className="px-3 pb-3 space-y-2">
+              <div className="text-[10px] text-slate-300 leading-relaxed">
+                {algoData.description}
+              </div>
+
+              {algoData.pattern && (
+                <div className="text-[9px] font-mono text-amber-400/80 bg-amber-900/20 p-1.5 rounded">
+                  {algoData.pattern}
+                </div>
+              )}
+
+              {algoData.advantage && (
+                <div className="text-[9px] text-green-400/80">
+                  <span className="text-slate-500">Advantage:</span> {algoData.advantage}
+                </div>
+              )}
+
+              {algoData.weakness && (
+                <div className="text-[9px] text-red-400/80">
+                  <span className="text-slate-500">Weakness:</span> {algoData.weakness}
+                </div>
+              )}
+
+              {algoData.steps && (
+                <div className="text-[9px] text-slate-400">
+                  <span className="text-slate-500">Steps:</span> <span className="font-mono">{algoData.steps}</span>
+                </div>
+              )}
+
+              {algoData.bandwidth && (
+                <div className="text-[9px] text-cyan-400/80">
+                  <span className="text-slate-500">Bandwidth:</span> {algoData.bandwidth}
+                </div>
+              )}
+
+              {algoData.hardware && (
+                <div className="text-[9px] text-violet-300 bg-violet-900/20 p-1.5 rounded border border-violet-700/30">
+                  <Cpu size={10} className="inline mr-1" />
+                  {algoData.hardware}
+                </div>
+              )}
+
+              {algoData.complexity && (
+                <div className={clsx(
+                  "text-[9px] font-semibold",
+                  isNVLS ? "text-violet-300" : "text-blue-300"
+                )}>
+                  {algoData.complexity}
+                </div>
+              )}
+
+              {algoData.applicability && (
+                <div className="text-[8px] text-slate-500 italic">
+                  {algoData.applicability}
+                </div>
+              )}
+            </div>
+          )}
+        </div>
+
+        {/* Hardware Comparison Section */}
+        <div>
+          <button
+            onClick={() => toggleSection('hardware')}
+            className="w-full p-2.5 flex items-center justify-between text-left hover:bg-slate-700/30 transition-colors"
+          >
+            <span className="text-[10px] font-semibold text-slate-400 uppercase tracking-wider flex items-center gap-1.5">
+              <Zap size={10} className="text-violet-400" />
+              H100 Comparison
+            </span>
+            {expandedSection === 'hardware' ? <ChevronUp size={12} className="text-slate-500" /> : <ChevronDown size={12} className="text-slate-500" />}
+          </button>
+
+          {expandedSection === 'hardware' && (
+            <div className="px-3 pb-3 space-y-2">
+              {/* Comparison Table */}
+              <div className="overflow-hidden rounded border border-slate-600/50">
+                <table className="w-full text-[8px]">
+                  <thead>
+                    <tr className="bg-slate-700/50">
+                      {KNOWLEDGE_DATA.hardware.comparison.headers.map((h, i) => (
+                        <th key={i} className={clsx(
+                          "p-1.5 text-left font-semibold",
+                          i === 0 ? "text-slate-400" : i === 1 ? "text-blue-400" : "text-violet-400"
+                        )}>
+                          {h}
+                        </th>
+                      ))}
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {KNOWLEDGE_DATA.hardware.comparison.rows.map((row, i) => (
+                      <tr key={i} className="border-t border-slate-700/50">
+                        {row.map((cell, j) => (
+                          <td key={j} className={clsx(
+                            "p-1.5",
+                            j === 0 ? "text-slate-400 font-medium" : "text-slate-300 font-mono"
+                          )}>
+                            {cell}
+                          </td>
+                        ))}
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+
+              {/* Hardware Details */}
+              <div className="space-y-1.5">
+                <div className="text-[9px] text-slate-400">
+                  <span className="text-slate-500">Topology:</span> {KNOWLEDGE_DATA.hardware.h100.topology.nodes}
+                </div>
+                <div className="text-[9px] text-slate-400">
+                  <span className="text-slate-500">Interconnect:</span> {KNOWLEDGE_DATA.hardware.h100.topology.interconnect}
+                </div>
+                <div className="text-[9px] text-cyan-400/80">
+                  <span className="text-slate-500">Bandwidth:</span> {KNOWLEDGE_DATA.hardware.h100.topology.bandwidth}
+                </div>
+                <div className="text-[9px] text-slate-400">
+                  <span className="text-slate-500">Connectivity:</span> {KNOWLEDGE_DATA.hardware.h100.topology.connectivity}
+                </div>
+              </div>
+
+              {/* NVSwitch Details */}
+              <div className="bg-violet-900/20 p-2 rounded border border-violet-700/30 space-y-1">
+                <div className="text-[9px] text-violet-300 font-semibold flex items-center gap-1">
+                  <Zap size={10} />
+                  NVSwitch v3 SHARP
+                </div>
+                <div className="text-[8px] text-slate-400">
+                  {KNOWLEDGE_DATA.hardware.h100.nvswitch.technology}
+                </div>
+                <div className="text-[8px] text-slate-400">
+                  {KNOWLEDGE_DATA.hardware.h100.nvswitch.capability}
+                </div>
+                <div className="text-[8px] text-green-400/80">
+                  {KNOWLEDGE_DATA.hardware.h100.nvswitch.benefit}
+                </div>
+              </div>
+            </div>
+          )}
+        </div>
+      </div>
+    </div>
+  );
+};
+
 // === MAIN COMPONENT ===
 const App = () => {
   const [operation, setOperation] = useState(Operation.AllReduce);
@@ -1303,6 +1798,7 @@ const App = () => {
   const [timeline, setTimeline] = useState(null);
   const [showBuffers, setShowBuffers] = useState(true);
   const [showBandwidth, setShowBandwidth] = useState(true);
+  const [showKnowledge, setShowKnowledge] = useState(true);
 
   const lastTimeRef = useRef(0);
 
@@ -1599,6 +2095,13 @@ const App = () => {
               >
                 {showBuffers ? <Eye size={14} /> : <EyeOff size={14} />}
               </button>
+              <button
+                onClick={() => setShowKnowledge(!showKnowledge)}
+                className={clsx("p-1 rounded", showKnowledge ? "text-violet-400" : "text-slate-600")}
+                title="Knowledge Base"
+              >
+                <BookOpen size={14} />
+              </button>
             </div>
           </div>
 
@@ -1615,6 +2118,13 @@ const App = () => {
               timeline={timeline}
               currentTime={currentTime}
               nodeCount={timeline?.nodeCount || 8}
+            />
+          )}
+
+          {showKnowledge && (
+            <KnowledgePanel
+              operation={operation}
+              algorithm={algorithm}
             />
           )}
         </div>
