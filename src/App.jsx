@@ -802,28 +802,92 @@ const BandwidthChart = ({ timeline, currentTime, topology }) => {
   const chartHeight = height - padding.top - padding.bottom;
 
   const bucketCount = 50;
-  const bucketDuration = timeline.duration / bucketCount;
+  const safeDuration = Math.max(1, timeline.duration || 0);
+  const bucketDuration = safeDuration / bucketCount;
 
   const utilizationData = useMemo(() => {
     const buckets = Array(bucketCount).fill(0);
-    const maxLinks = topology === Topology.MultiNode ? 16 : 8;
+    const maxLinks = topology === Topology.MultiNode
+      ? 16
+      : (topology === Topology.FourGPU ? 4 : 8);
+    const samples = [...(timeline.bandwidthSamples || [])];
 
-    timeline.bandwidthSamples.forEach(sample => {
-      const startBucket = Math.floor(sample.time / bucketDuration);
-      const endBucket = Math.floor(sample.endTime / bucketDuration);
+    // NVLS/MultiShot switch traffic doesn't populate bandwidthSamples; derive from events.
+    if (timeline.events && timeline.events.length) {
+      timeline.events.forEach((evt) => {
+        const endTime = evt.startTime + evt.duration;
+        if (evt.type === 'to-switch') {
+          samples.push({
+            time: evt.startTime,
+            endTime,
+            linkId: `sw-in-${evt.from}`,
+            from: evt.from,
+            to: 'switch',
+            direction: 'in',
+            utilization: 1.0
+          });
+        } else if (evt.type === 'from-switch' && Array.isArray(evt.destinations)) {
+          evt.destinations.forEach((dest) => {
+            samples.push({
+              time: evt.startTime,
+              endTime,
+              linkId: `sw-out-${dest}`,
+              from: 'switch',
+              to: dest,
+              direction: 'out',
+              utilization: 1.0
+            });
+          });
+        } else if (evt.type === 'from-switch-single' && evt.destination !== undefined) {
+          samples.push({
+            time: evt.startTime,
+            endTime,
+            linkId: `sw-out-${evt.destination}`,
+            from: 'switch',
+            to: evt.destination,
+            direction: 'out',
+            utilization: 1.0
+          });
+        } else if (evt.type === 'switch-broadcast' && Array.isArray(evt.destinations)) {
+          evt.destinations.forEach((dest) => {
+            samples.push({
+              time: evt.startTime,
+              endTime,
+              linkId: `sw-bc-${dest}`,
+              from: 'switch',
+              to: dest,
+              direction: 'out',
+              utilization: 1.0
+            });
+          });
+        }
+      });
+    }
 
-      for (let b = startBucket; b <= endBucket && b < bucketCount; b++) {
+    samples.forEach(sample => {
+      const startBucket = Math.max(0, Math.min(bucketCount - 1, Math.floor(sample.time / bucketDuration)));
+      const endBucket = Math.max(0, Math.min(bucketCount - 1, Math.floor(sample.endTime / bucketDuration)));
+
+      for (let b = startBucket; b <= endBucket; b++) {
         buckets[b] += 1 / maxLinks;
       }
     });
 
     return buckets.map((v, i) => ({
       time: i * bucketDuration,
-      utilization: Math.min(1, v)
+      utilization: Math.min(1, Math.max(0, v))
     }));
   }, [timeline, bucketDuration, topology]);
 
-  const maxUtil = Math.max(...utilizationData.map(d => d.utilization), 0.1);
+  const yFor = (utilization) => chartHeight * (1 - Math.min(1, Math.max(0, utilization)));
+  const points = utilizationData.map((d, i) =>
+    `${(i / bucketCount) * chartWidth} ${yFor(d.utilization)}`
+  );
+  const lastUtil = utilizationData.length ? utilizationData[utilizationData.length - 1].utilization : 0;
+  const lastY = yFor(lastUtil);
+  const areaPath = `M 0 ${chartHeight} L ${points.join(' L ')} L ${chartWidth} ${lastY} L ${chartWidth} ${chartHeight} Z`;
+  const linePath = `M ${points.join(' L ')} L ${chartWidth} ${lastY}`;
+  const progressX = Math.max(0, Math.min(chartWidth, (currentTime / safeDuration) * chartWidth));
 
   return (
     <div className="bg-slate-800/50 rounded-lg p-3 border border-slate-700">
@@ -859,25 +923,21 @@ const BandwidthChart = ({ timeline, currentTime, topology }) => {
           ))}
 
           <path
-            d={`M 0 ${chartHeight} ${utilizationData.map((d, i) =>
-              `L ${(i / bucketCount) * chartWidth} ${chartHeight * (1 - d.utilization / maxUtil)}`
-            ).join(' ')} L ${chartWidth} ${chartHeight} Z`}
+            d={areaPath}
             fill="url(#utilGradient)"
           />
 
           <path
-            d={`M ${utilizationData.map((d, i) =>
-              `${(i / bucketCount) * chartWidth} ${chartHeight * (1 - d.utilization / maxUtil)}`
-            ).join(' L ')}`}
+            d={linePath}
             fill="none"
             className="stroke-green-400"
             strokeWidth={1.5}
           />
 
           <line
-            x1={(currentTime / timeline.duration) * chartWidth}
+            x1={progressX}
             y1={0}
-            x2={(currentTime / timeline.duration) * chartWidth}
+            x2={progressX}
             y2={chartHeight}
             className="stroke-white"
             strokeWidth={1}
